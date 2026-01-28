@@ -18,6 +18,9 @@ LISTING_URLS = {
 }
 
 
+# --------------------
+# ENV HELPERS
+# --------------------
 def _env_float(name: str, default: float) -> float:
     try:
         return float(os.getenv(name, str(default)))
@@ -61,6 +64,9 @@ def polite_sleep():
     time.sleep(SCRAPE_DELAY)
 
 
+# --------------------
+# HTTP FETCH
+# --------------------
 @retry(
     retry=retry_if_exception_type((requests.RequestException, ScrapeError)),
     stop=stop_after_attempt(3),
@@ -73,6 +79,9 @@ def fetch_html(url: str) -> str:
     return resp.text
 
 
+# --------------------
+# ROBOTS.TXT (via requests)
+# --------------------
 def build_robots_parser() -> robotparser.RobotFileParser:
     rp = robotparser.RobotFileParser()
     robots_url = urljoin(BASE, "/robots.txt")
@@ -92,117 +101,93 @@ def robots_allowed(rp: robotparser.RobotFileParser, url: str) -> bool:
     return rp.can_fetch(UA, url)
 
 
+# --------------------
+# TEXT CLEANING
+# --------------------
 def clean_text(text: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
-def is_real_article_url(url: str) -> bool:
-    """
-    Filter out non-article pages that can appear on listing pages.
-    Real articles are usually /sk/article/<slug>
-    We'll also require a slug with at least one dash or longer than a few chars.
-    """
-    if not url.startswith("https://www.hockeyslovakia.sk/sk/article/"):
-        return False
-
-    slug = url.split("/sk/article/")[-1].strip("/")
-    if not slug:
-        return False
-
-    # Reject known non-article slugs (example you hit)
-    blocked = {"zakladne-udaje"}
-    if slug in blocked:
-        return False
-
-    # Heuristic: most news slugs are longer and often include '-'
-    if len(slug) < 8:
-        return False
-
-    return True
-
-
+# --------------------
+# LISTING PARSER (KEY FIX)
+# --------------------
 def extract_article_links(listing_html: str) -> list[str]:
     """
-    Safer extraction:
-    - Prefer anchors inside article listing containers if present.
-    - Then fallback to generic /sk/article/ links but filtered.
+    Extract ONLY real article links from article listing.
+    This avoids menu/footer/internal pages.
     """
     soup = BeautifulSoup(listing_html, "lxml")
 
-    candidates: list[str] = []
+    links: list[str] = []
 
-    # 1) try: links inside typical list areas (less menu/nav noise)
-    for a in soup.select('section a[href^="/sk/article/"], main a[href^="/sk/article/"], .col-content a[href^="/sk/article/"]'):
-        href = a.get("href")
-        if href:
-            candidates.append(urljoin(BASE, href))
+    # Articles are inside article cards
+    # This selector is intentionally strict
+    for item in soup.select("article, .article-item, .news-item"):
+        a = item.find("a", href=True)
+        if not a:
+            continue
 
-    # 2) fallback: any /sk/article/ link
-    if not candidates:
-        for a in soup.select('a[href^="/sk/article/"]'):
-            href = a.get("href")
-            if href:
-                candidates.append(urljoin(BASE, href))
+        href = a["href"]
+        if not href.startswith("/sk/article/"):
+            continue
 
-    # de-dupe keep order + filter non-articles
+        full_url = urljoin(BASE, href)
+        links.append(full_url)
+
+    # Fallback: known article list structure
+    if not links:
+        for a in soup.select(".articles-list a[href^='/sk/article/']"):
+            links.append(urljoin(BASE, a["href"]))
+
+    # De-duplicate & limit
     seen = set()
     ordered: list[str] = []
-    for u in candidates:
+    for u in links:
         if u in seen:
             continue
         seen.add(u)
-        if is_real_article_url(u):
-            ordered.append(u)
+        ordered.append(u)
 
     return ordered[:MAX_PER_RUN]
 
 
+# --------------------
+# ARTICLE DETAIL
+# --------------------
 def parse_article_detail(article_html: str, article_url: str) -> dict:
     soup = BeautifulSoup(article_html, "lxml")
 
     h1 = soup.select_one("h1")
     if not h1:
-        raise ScrapeError(f"Missing h1 on {article_url}")
+        raise ScrapeError(f"Missing title on {article_url}")
     title = clean_text(h1.get_text(" ", strip=True))
 
-    meta = soup.select_one(".article-meta.clearfix")
+    meta = soup.select_one(".article-meta")
     meta_text = clean_text(meta.get_text(" ", strip=True)) if meta else None
 
     image_url = None
-    gallery = soup.select_one(".document-gallery.margin-bottom-30")
+    gallery = soup.select_one(".document-gallery")
     if gallery:
-        img = gallery.select_one("img")
+        img = gallery.find("img")
         if img and img.get("src"):
             image_url = urljoin(BASE, img["src"])
 
-    # Your expected container
-    content = soup.select_one(".col-md-8.col-lg-9.col-content")
-
-    # Fallbacks (some templates differ)
-    if not content:
-        content = soup.select_one(".col-content")
-    if not content:
-        content = soup.select_one("article")
-    if not content:
-        # As last resort: main content area
-        content = soup.select_one("main")
-
+    content = soup.select_one(".col-content")
     if not content:
         raise ScrapeError(f"Missing content container on {article_url}")
 
-    parts: list[str] = []
+    parts = []
     for node in content.select("p, h2, h3, li"):
         t = node.get_text(" ", strip=True)
         if t:
             parts.append(t)
 
-    content_text = clean_text("\n".join(parts)) if parts else clean_text(content.get_text("\n", strip=True))
+    content_text = clean_text("\n".join(parts))
 
-    # Extra safety: if the extracted text is too short, it's likely not a news article
-    if len(content_text) < 200:
-        raise ScrapeError(f"Content too short (not a real article) on {article_url}")
+    if len(content_text) < 150:
+        raise ScrapeError(f"Content too short on {article_url}")
 
     return {
         "title": title,
@@ -212,7 +197,13 @@ def parse_article_detail(article_html: str, article_url: str) -> dict:
     }
 
 
-def scrape_listing(rp: robotparser.RobotFileParser, category: str, listing_url: str) -> list[dict]:
+# --------------------
+# SCRAPE LISTING
+# --------------------
+def scrape_listing(
+    rp: robotparser.RobotFileParser, category: str, listing_url: str
+) -> list[dict]:
+
     if not robots_allowed(rp, listing_url):
         raise ScrapeError(f"Robots disallow listing: {listing_url}")
 
@@ -236,7 +227,6 @@ def scrape_listing(rp: robotparser.RobotFileParser, category: str, listing_url: 
             items.append(data)
 
         except ScrapeError as e:
-            # skip bad/non-article pages without killing the whole run
             print(f"[SCRAPER] skip url={url} reason={e}")
             continue
 
