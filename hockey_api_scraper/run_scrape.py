@@ -1,5 +1,10 @@
-from datetime import datetime, timezone
+# run_scrape.py
 from dotenv import load_dotenv
+
+# MUST be called before importing db.py (ENGINE is created at import time)
+load_dotenv()
+
+from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
@@ -7,12 +12,15 @@ from db import SessionLocal, ENGINE
 from models import Base, Article
 from scraper import build_robots_parser, LISTING_URLS, scrape_listing
 
+
 def init_db():
     Base.metadata.create_all(bind=ENGINE)
+
 
 def already_exists(db, origin_url: str) -> bool:
     q = select(Article.id).where(Article.origin_url == origin_url).limit(1)
     return db.execute(q).first() is not None
+
 
 def run_scrape() -> dict:
     init_db()
@@ -27,6 +35,7 @@ def run_scrape() -> dict:
             scanned += len(items)
 
             for item in items:
+                # avoid duplicate work
                 if already_exists(db, item["origin_url"]):
                     continue
 
@@ -45,10 +54,11 @@ def run_scrape() -> dict:
                     db.commit()
                     inserted += 1
                 except IntegrityError:
+                    # if another process inserted the same URL in between
                     db.rollback()
 
     return {"scanned": scanned, "inserted_new": inserted}
 
+
 if __name__ == "__main__":
-    load_dotenv()
     print(run_scrape())
