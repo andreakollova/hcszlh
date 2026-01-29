@@ -1,4 +1,3 @@
-# scraper.py
 from __future__ import annotations
 
 import os
@@ -20,9 +19,6 @@ LISTING_URLS = {
 }
 
 
-# --------------------
-# ENV HELPERS
-# --------------------
 def _env_float(name: str, default: float) -> float:
     try:
         return float(os.getenv(name, str(default)))
@@ -62,13 +58,10 @@ class ScrapeError(Exception):
     pass
 
 
-def polite_sleep():
+def polite_sleep() -> None:
     time.sleep(SCRAPE_DELAY)
 
 
-# --------------------
-# HTTP FETCH
-# --------------------
 @retry(
     retry=retry_if_exception_type((requests.RequestException, ScrapeError)),
     stop=stop_after_attempt(3),
@@ -81,9 +74,6 @@ def fetch_html(url: str) -> str:
     return resp.text
 
 
-# --------------------
-# ROBOTS.TXT
-# --------------------
 def build_robots_parser() -> robotparser.RobotFileParser:
     rp = robotparser.RobotFileParser()
     robots_url = urljoin(BASE, "/robots.txt")
@@ -94,7 +84,6 @@ def build_robots_parser() -> robotparser.RobotFileParser:
 
     rp.set_url(robots_url)
     rp.parse(resp.text.splitlines())
-
     polite_sleep()
     return rp
 
@@ -103,9 +92,6 @@ def robots_allowed(rp: robotparser.RobotFileParser, url: str) -> bool:
     return rp.can_fetch(UA, url)
 
 
-# --------------------
-# TEXT CLEANING
-# --------------------
 def clean_text(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
@@ -113,9 +99,6 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-# --------------------
-# LISTING: extract url + thumbnail from style background-image
-# --------------------
 _BG_RE = re.compile(r"background-image\s*:\s*url\((['\"]?)(.*?)\1\)", re.IGNORECASE)
 
 
@@ -125,44 +108,54 @@ def _extract_bg_image_from_style(style: str) -> str | None:
     m = _BG_RE.search(style)
     if not m:
         return None
-    url = (m.group(2) or "").strip()
-    if not url:
-        return None
-    # normalize quotes/spaces
-    url = url.strip("'\"").strip()
-    return url
+    raw = (m.group(2) or "").strip().strip("'\"").strip()
+    return raw or None
 
 
 def extract_listing_items(listing_html: str) -> list[dict]:
     """
-    Returns list of items: [{"origin_url":..., "image_url":...}, ...]
-    - Picks anchors to /sk/article/...
-    - Gets thumbnail from inline style background-image on the <a> card (your screenshot).
-    - Dedupes + limits.
+    STRICT: ber iba news tiles (to, čo má class article-item + background-image)
+    Typická štruktúra podľa tvojho DevTools:
+      <article ...>
+        <div class="overlay-container">
+          <a class="article-item ... lazy" href="/sk/article/..." style="background-image:url('...')">
     """
     soup = BeautifulSoup(listing_html, "lxml")
 
     candidates: list[dict] = []
 
-    # Most relevant: the tile anchor itself has background-image inline style
-    # <a href="/sk/article/..." class="article-item ..." style="background-image:url('...')">
-    for a in soup.select('a[href^="/sk/article/"]'):
+    # 1) Najpresnejšie: iba tile linky v článkových <article> blokoch
+    for a in soup.select('article .overlay-container a.article-item[href^="/sk/article/"]'):
         href = (a.get("href") or "").strip()
         if not href.startswith("/sk/article/"):
             continue
 
-        full_url = urljoin(BASE, href)
+        origin_url = urljoin(BASE, href)
 
         thumb = None
-        style = a.get("style", "")
-        bg = _extract_bg_image_from_style(style)
+        bg = _extract_bg_image_from_style(a.get("style", ""))
         if bg:
             thumb = urljoin(BASE, bg)
 
-        candidates.append({"origin_url": full_url, "image_url": thumb})
+        candidates.append({"origin_url": origin_url, "image_url": thumb})
 
-    # de-dupe keep order
-    seen = set()
+    # 2) Fallback: stále len .article-item, ale kdekoľvek (nie všetky stránky majú overlay-container)
+    if not candidates:
+        for a in soup.select('a.article-item[href^="/sk/article/"]'):
+            href = (a.get("href") or "").strip()
+            if not href.startswith("/sk/article/"):
+                continue
+            origin_url = urljoin(BASE, href)
+
+            thumb = None
+            bg = _extract_bg_image_from_style(a.get("style", ""))
+            if bg:
+                thumb = urljoin(BASE, bg)
+
+            candidates.append({"origin_url": origin_url, "image_url": thumb})
+
+    # de-dupe keep order + limit
+    seen: set[str] = set()
     ordered: list[dict] = []
     for it in candidates:
         u = it["origin_url"]
@@ -174,14 +167,7 @@ def extract_listing_items(listing_html: str) -> list[dict]:
     return ordered[:MAX_PER_RUN]
 
 
-# --------------------
-# DETAIL: robust image extraction
-# --------------------
 def extract_detail_image_url(soup: BeautifulSoup) -> str | None:
-    """
-    Try multiple known patterns on the article detail page.
-    Supports lazy attributes.
-    """
     def pick_img(sel: str) -> str | None:
         img = soup.select_one(sel)
         if not img:
@@ -192,22 +178,21 @@ def extract_detail_image_url(soup: BeautifulSoup) -> str | None:
                 return urljoin(BASE, val.strip())
         return None
 
-    # 1) what you showed earlier
+    # presne to, čo máš na detaile
     url = pick_img(".document-gallery .doc-image-main img")
     if url:
         return url
 
-    # 2) any in document gallery
     url = pick_img(".document-gallery img")
     if url:
         return url
 
-    # 3) sometimes hero image is in static-page or main content above text
+    # niekedy môže byť hero v static-page
     url = pick_img(".static-page img")
     if url:
         return url
 
-    # 4) inline images inside content
+    # posledná záchrana: prvý obrázok v texte
     url = pick_img(".col-content img")
     if url:
         return url
@@ -215,9 +200,6 @@ def extract_detail_image_url(soup: BeautifulSoup) -> str | None:
     return None
 
 
-# --------------------
-# ARTICLE DETAIL
-# --------------------
 def parse_article_detail(article_html: str, article_url: str) -> dict:
     soup = BeautifulSoup(article_html, "lxml")
 
@@ -229,12 +211,11 @@ def parse_article_detail(article_html: str, article_url: str) -> dict:
     meta = soup.select_one(".article-meta")
     meta_text = clean_text(meta.get_text(" ", strip=True)) if meta else None
 
-    # content container – allow your strict selector + fallbacks
+    # content container
     content = soup.select_one(".col-md-8.col-lg-9.col-content")
     if not content:
         content = soup.select_one(".col-content")
     if not content:
-        # some templates wrap the article content in .static-page
         content = soup.select_one(".static-page")
     if not content:
         raise ScrapeError(f"Missing content container on {article_url}")
@@ -246,8 +227,6 @@ def parse_article_detail(article_html: str, article_url: str) -> dict:
             parts.append(t)
 
     content_text = clean_text("\n".join(parts)) if parts else clean_text(content.get_text("\n", strip=True))
-
-    # prevent non-article pages from being stored
     if len(content_text) < 150:
         raise ScrapeError(f"Content too short on {article_url}")
 
@@ -261,13 +240,7 @@ def parse_article_detail(article_html: str, article_url: str) -> dict:
     }
 
 
-# --------------------
-# SCRAPE LISTING
-# --------------------
-def scrape_listing(
-    rp: robotparser.RobotFileParser, category: str, listing_url: str
-) -> list[dict]:
-
+def scrape_listing(rp: robotparser.RobotFileParser, category: str, listing_url: str) -> list[dict]:
     if not robots_allowed(rp, listing_url):
         raise ScrapeError(f"Robots disallow listing: {listing_url}")
 
@@ -279,7 +252,7 @@ def scrape_listing(
     items: list[dict] = []
     for li in listing_items:
         url = li["origin_url"]
-        listing_thumb = li.get("image_url")  # from background-image
+        listing_thumb = li.get("image_url")
 
         if not robots_allowed(rp, url):
             continue
@@ -290,7 +263,7 @@ def scrape_listing(
 
             data = parse_article_detail(html, url)
 
-            # IMPORTANT: fallback to listing thumbnail if detail has no image
+            # fallback: ak detail nič nemá, použi thumbnail z karty (správny tile)
             if not data.get("image_url") and listing_thumb:
                 data["image_url"] = listing_thumb
 

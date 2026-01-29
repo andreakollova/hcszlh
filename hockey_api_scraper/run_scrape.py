@@ -1,4 +1,3 @@
-# run_scrape.py
 from __future__ import annotations
 
 from dotenv import load_dotenv
@@ -29,16 +28,41 @@ def is_missing(val: str | None) -> bool:
 
 
 def should_replace_text(existing: str | None, new: str | None) -> bool:
-    """
-    Replace content_text only if:
-    - existing is missing OR
-    - new is significantly longer (avoid overwriting good content with short noise)
-    """
     if is_missing(new):
         return False
     if is_missing(existing):
         return True
     return len(new) > len(existing) + 80
+
+
+def is_good_image(url: str | None) -> bool:
+    if is_missing(url):
+        return False
+    u = str(url)
+    # hockeyslovakia používa Upload/Gallery ako hlavný zdroj
+    return ("/Upload/Gallery/" in u) or ("/Upload/" in u)
+
+
+def should_replace_image(existing: str | None, new: str | None) -> bool:
+    """
+    Prepíš image_url ak:
+    - existing je prázdne a new existuje
+    - alebo new vyzerá "lepšie" (Upload/Gallery) a existing nie
+    - alebo existing vyzerá ako niečo mimo (nie Upload) a new je Upload
+    """
+    if is_missing(new):
+        return False
+    if is_missing(existing):
+        return True
+
+    if is_good_image(new) and not is_good_image(existing):
+        return True
+
+    # ak sa líšia a nové je z Upload/Gallery, preferuj nové
+    if str(new).strip() != str(existing).strip() and is_good_image(new):
+        return True
+
+    return False
 
 
 def run_scrape() -> dict:
@@ -68,9 +92,6 @@ def run_scrape() -> dict:
                 origin_url = item["origin_url"]
                 existing = get_existing(db, origin_url)
 
-                # -----------------------
-                # INSERT NEW
-                # -----------------------
                 if existing is None:
                     art = Article(
                         category=item.get("category", category),
@@ -93,34 +114,26 @@ def run_scrape() -> dict:
                         errors += 1
                     continue
 
-                # -----------------------
-                # UPDATE EXISTING (fill missing / improve)
-                # -----------------------
                 changed = False
 
-                # category: keep existing unless empty
                 if is_missing(existing.category) and item.get("category"):
                     existing.category = item["category"]
                     changed = True
 
-                # title: update only if missing
                 if is_missing(existing.title) and item.get("title"):
                     existing.title = item["title"]
                     changed = True
 
-                # meta_text: fill if missing
                 if is_missing(existing.meta_text) and item.get("meta_text"):
                     existing.meta_text = item["meta_text"]
                     changed = True
 
-                # image_url: fill if missing
-                if is_missing(existing.image_url) and item.get("image_url"):
-                    existing.image_url = item["image_url"]
+                if should_replace_image(existing.image_url, item.get("image_url")):
+                    existing.image_url = item.get("image_url")
                     changed = True
 
-                # content_text: fill if missing or new is much better
                 if should_replace_text(existing.content_text, item.get("content_text")):
-                    existing.content_text = item["content_text"]
+                    existing.content_text = item.get("content_text") or existing.content_text
                     changed = True
 
                 if changed:
