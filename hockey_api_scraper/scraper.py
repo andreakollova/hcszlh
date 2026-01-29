@@ -1,4 +1,6 @@
 # scraper.py
+from __future__ import annotations
+
 import os
 import time
 import re
@@ -80,7 +82,7 @@ def fetch_html(url: str) -> str:
 
 
 # --------------------
-# ROBOTS.TXT (via requests)
+# ROBOTS.TXT
 # --------------------
 def build_robots_parser() -> robotparser.RobotFileParser:
     rp = robotparser.RobotFileParser()
@@ -105,7 +107,6 @@ def robots_allowed(rp: robotparser.RobotFileParser, url: str) -> bool:
 # TEXT CLEANING
 # --------------------
 def clean_text(text: str) -> str:
-    # normalize line endings first
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -113,79 +114,103 @@ def clean_text(text: str) -> str:
 
 
 # --------------------
-# LISTING PARSER (STRICT)
+# LISTING: extract url + thumbnail from style background-image
 # --------------------
-def extract_article_links(listing_html: str) -> list[str]:
+_BG_RE = re.compile(r"background-image\s*:\s*url\((['\"]?)(.*?)\1\)", re.IGNORECASE)
+
+
+def _extract_bg_image_from_style(style: str) -> str | None:
+    if not style:
+        return None
+    m = _BG_RE.search(style)
+    if not m:
+        return None
+    url = (m.group(2) or "").strip()
+    if not url:
+        return None
+    # normalize quotes/spaces
+    url = url.strip("'\"").strip()
+    return url
+
+
+def extract_listing_items(listing_html: str) -> list[dict]:
     """
-    Extract ONLY real article links from article listing.
-    This avoids menu/footer/internal pages.
+    Returns list of items: [{"origin_url":..., "image_url":...}, ...]
+    - Picks anchors to /sk/article/...
+    - Gets thumbnail from inline style background-image on the <a> card (your screenshot).
+    - Dedupes + limits.
     """
     soup = BeautifulSoup(listing_html, "lxml")
-    links: list[str] = []
 
-    # Cards/tiles usually wrap one main <a href="/sk/article/...">
-    for item in soup.select("article, .article-item, .news-item"):
-        a = item.find("a", href=True)
-        if not a:
-            continue
+    candidates: list[dict] = []
 
-        href = a["href"].strip()
+    # Most relevant: the tile anchor itself has background-image inline style
+    # <a href="/sk/article/..." class="article-item ..." style="background-image:url('...')">
+    for a in soup.select('a[href^="/sk/article/"]'):
+        href = (a.get("href") or "").strip()
         if not href.startswith("/sk/article/"):
             continue
 
-        links.append(urljoin(BASE, href))
+        full_url = urljoin(BASE, href)
 
-    # Fallback: known list structure
-    if not links:
-        for a in soup.select("a[href^='/sk/article/']"):
-            href = a.get("href", "").strip()
-            if href.startswith("/sk/article/"):
-                links.append(urljoin(BASE, href))
+        thumb = None
+        style = a.get("style", "")
+        bg = _extract_bg_image_from_style(style)
+        if bg:
+            thumb = urljoin(BASE, bg)
 
-    # De-duplicate & limit
+        candidates.append({"origin_url": full_url, "image_url": thumb})
+
+    # de-dupe keep order
     seen = set()
-    ordered: list[str] = []
-    for u in links:
+    ordered: list[dict] = []
+    for it in candidates:
+        u = it["origin_url"]
         if u in seen:
             continue
         seen.add(u)
-        ordered.append(u)
+        ordered.append(it)
 
     return ordered[:MAX_PER_RUN]
 
 
 # --------------------
-# IMAGE EXTRACTION (KEY FIX)
+# DETAIL: robust image extraction
 # --------------------
-def extract_image_url(soup: BeautifulSoup) -> str | None:
+def extract_detail_image_url(soup: BeautifulSoup) -> str | None:
     """
-    Prefer hero image in document gallery:
-      .document-gallery .doc-image-main img.img-responsive.lazy
-    Supports lazy attributes: data-src, data-original, etc.
+    Try multiple known patterns on the article detail page.
+    Supports lazy attributes.
     """
-    # 1) Most accurate (what you showed in DevTools)
-    img = soup.select_one(".document-gallery .doc-image-main img")
-    if img:
-        for attr in ("src", "data-src", "data-original", "data-lazy-src"):
+    def pick_img(sel: str) -> str | None:
+        img = soup.select_one(sel)
+        if not img:
+            return None
+        for attr in ("src", "data-src", "data-original", "data-lazy-src", "data-lazy"):
             val = img.get(attr)
             if val:
-                return urljoin(BASE, val)
+                return urljoin(BASE, val.strip())
+        return None
 
-    # 2) Fallback: any image inside document gallery
-    img = soup.select_one(".document-gallery img")
-    if img:
-        for attr in ("src", "data-src", "data-original", "data-lazy-src"):
-            val = img.get(attr)
-            if val:
-                return urljoin(BASE, val)
+    # 1) what you showed earlier
+    url = pick_img(".document-gallery .doc-image-main img")
+    if url:
+        return url
 
-    # 3) Optional fallback: sometimes content has inline images
-    img = soup.select_one(".col-content img")
-    if img:
-        for attr in ("src", "data-src", "data-original", "data-lazy-src"):
-            val = img.get(attr)
-            if val:
-                return urljoin(BASE, val)
+    # 2) any in document gallery
+    url = pick_img(".document-gallery img")
+    if url:
+        return url
+
+    # 3) sometimes hero image is in static-page or main content above text
+    url = pick_img(".static-page img")
+    if url:
+        return url
+
+    # 4) inline images inside content
+    url = pick_img(".col-content img")
+    if url:
+        return url
 
     return None
 
@@ -204,12 +229,13 @@ def parse_article_detail(article_html: str, article_url: str) -> dict:
     meta = soup.select_one(".article-meta")
     meta_text = clean_text(meta.get_text(" ", strip=True)) if meta else None
 
-    image_url = extract_image_url(soup)
-
-    # Your expected container (keep strict, but with safe fallback)
+    # content container – allow your strict selector + fallbacks
     content = soup.select_one(".col-md-8.col-lg-9.col-content")
     if not content:
         content = soup.select_one(".col-content")
+    if not content:
+        # some templates wrap the article content in .static-page
+        content = soup.select_one(".static-page")
     if not content:
         raise ScrapeError(f"Missing content container on {article_url}")
 
@@ -219,10 +245,13 @@ def parse_article_detail(article_html: str, article_url: str) -> dict:
         if t:
             parts.append(t)
 
-    content_text = clean_text("\n".join(parts))
+    content_text = clean_text("\n".join(parts)) if parts else clean_text(content.get_text("\n", strip=True))
 
+    # prevent non-article pages from being stored
     if len(content_text) < 150:
         raise ScrapeError(f"Content too short on {article_url}")
+
+    image_url = extract_detail_image_url(soup)
 
     return {
         "title": title,
@@ -245,10 +274,13 @@ def scrape_listing(
     listing_html = fetch_html(listing_url)
     polite_sleep()
 
-    links = extract_article_links(listing_html)
+    listing_items = extract_listing_items(listing_html)
 
     items: list[dict] = []
-    for url in links:
+    for li in listing_items:
+        url = li["origin_url"]
+        listing_thumb = li.get("image_url")  # from background-image
+
         if not robots_allowed(rp, url):
             continue
 
@@ -257,6 +289,11 @@ def scrape_listing(
             polite_sleep()
 
             data = parse_article_detail(html, url)
+
+            # IMPORTANT: fallback to listing thumbnail if detail has no image
+            if not data.get("image_url") and listing_thumb:
+                data["image_url"] = listing_thumb
+
             data["origin_url"] = url
             data["category"] = category
             items.append(data)
