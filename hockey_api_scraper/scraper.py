@@ -105,13 +105,15 @@ def robots_allowed(rp: robotparser.RobotFileParser, url: str) -> bool:
 # TEXT CLEANING
 # --------------------
 def clean_text(text: str) -> str:
+    # normalize line endings first
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
 # --------------------
-# LISTING PARSER (KEY FIX)
+# LISTING PARSER (STRICT)
 # --------------------
 def extract_article_links(listing_html: str) -> list[str]:
     """
@@ -119,27 +121,26 @@ def extract_article_links(listing_html: str) -> list[str]:
     This avoids menu/footer/internal pages.
     """
     soup = BeautifulSoup(listing_html, "lxml")
-
     links: list[str] = []
 
-    # Articles are inside article cards
-    # This selector is intentionally strict
+    # Cards/tiles usually wrap one main <a href="/sk/article/...">
     for item in soup.select("article, .article-item, .news-item"):
         a = item.find("a", href=True)
         if not a:
             continue
 
-        href = a["href"]
+        href = a["href"].strip()
         if not href.startswith("/sk/article/"):
             continue
 
-        full_url = urljoin(BASE, href)
-        links.append(full_url)
+        links.append(urljoin(BASE, href))
 
-    # Fallback: known article list structure
+    # Fallback: known list structure
     if not links:
-        for a in soup.select(".articles-list a[href^='/sk/article/']"):
-            links.append(urljoin(BASE, a["href"]))
+        for a in soup.select("a[href^='/sk/article/']"):
+            href = a.get("href", "").strip()
+            if href.startswith("/sk/article/"):
+                links.append(urljoin(BASE, href))
 
     # De-duplicate & limit
     seen = set()
@@ -151,6 +152,42 @@ def extract_article_links(listing_html: str) -> list[str]:
         ordered.append(u)
 
     return ordered[:MAX_PER_RUN]
+
+
+# --------------------
+# IMAGE EXTRACTION (KEY FIX)
+# --------------------
+def extract_image_url(soup: BeautifulSoup) -> str | None:
+    """
+    Prefer hero image in document gallery:
+      .document-gallery .doc-image-main img.img-responsive.lazy
+    Supports lazy attributes: data-src, data-original, etc.
+    """
+    # 1) Most accurate (what you showed in DevTools)
+    img = soup.select_one(".document-gallery .doc-image-main img")
+    if img:
+        for attr in ("src", "data-src", "data-original", "data-lazy-src"):
+            val = img.get(attr)
+            if val:
+                return urljoin(BASE, val)
+
+    # 2) Fallback: any image inside document gallery
+    img = soup.select_one(".document-gallery img")
+    if img:
+        for attr in ("src", "data-src", "data-original", "data-lazy-src"):
+            val = img.get(attr)
+            if val:
+                return urljoin(BASE, val)
+
+    # 3) Optional fallback: sometimes content has inline images
+    img = soup.select_one(".col-content img")
+    if img:
+        for attr in ("src", "data-src", "data-original", "data-lazy-src"):
+            val = img.get(attr)
+            if val:
+                return urljoin(BASE, val)
+
+    return None
 
 
 # --------------------
@@ -167,18 +204,16 @@ def parse_article_detail(article_html: str, article_url: str) -> dict:
     meta = soup.select_one(".article-meta")
     meta_text = clean_text(meta.get_text(" ", strip=True)) if meta else None
 
-    image_url = None
-    gallery = soup.select_one(".document-gallery")
-    if gallery:
-        img = gallery.find("img")
-        if img and img.get("src"):
-            image_url = urljoin(BASE, img["src"])
+    image_url = extract_image_url(soup)
 
-    content = soup.select_one(".col-content")
+    # Your expected container (keep strict, but with safe fallback)
+    content = soup.select_one(".col-md-8.col-lg-9.col-content")
+    if not content:
+        content = soup.select_one(".col-content")
     if not content:
         raise ScrapeError(f"Missing content container on {article_url}")
 
-    parts = []
+    parts: list[str] = []
     for node in content.select("p, h2, h3, li"):
         t = node.get_text(" ", strip=True)
         if t:
