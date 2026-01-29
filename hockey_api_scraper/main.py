@@ -1,7 +1,10 @@
 import os
 from dotenv import load_dotenv
+
 from fastapi import FastAPI, Depends, Query, HTTPException
 from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+
 from sqlalchemy import select, func, desc
 from sqlalchemy.orm import Session
 
@@ -13,12 +16,43 @@ load_dotenv()
 
 APP_NAME = os.getenv("APP_NAME", "hockeyslovakia-api-scraper")
 
+# ---------------------------
+# APP
+# ---------------------------
 app = FastAPI(title=APP_NAME, version="1.0.0")
 
+# ---------------------------
+# CORS (Fix for "Failed to fetch")
+# ---------------------------
+# Example:
+# CORS_ORIGINS="http://localhost:5173,https://tvoja-app.vercel.app"
+# Or during development/testing:
+# CORS_ORIGINS="*"
+cors_env = os.getenv("CORS_ORIGINS", "*").strip()
+
+if cors_env == "*":
+    allow_origins = ["*"]
+else:
+    allow_origins = [o.strip() for o in cors_env.split(",") if o.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=False,  # set True only if you REALLY need cookies
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------------------
+# STARTUP
+# ---------------------------
 @app.on_event("startup")
 def on_startup():
     Base.metadata.create_all(bind=ENGINE)
 
+# ---------------------------
+# DB DEP
+# ---------------------------
 def get_db():
     db = SessionLocal()
     try:
@@ -26,6 +60,9 @@ def get_db():
     finally:
         db.close()
 
+# ---------------------------
+# ROUTES
+# ---------------------------
 @app.get("/", response_class=HTMLResponse)
 def home():
     return f"""
